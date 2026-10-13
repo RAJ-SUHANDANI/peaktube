@@ -1,123 +1,168 @@
-import type { Video } from "./types";
+import type { Channel, Video, VideoResponse } from "./types";
 import { filterDemo } from "./demo";
 
-// Providers are deliberately configured, not silently assumed to support the same endpoints.
-// Register ONLY legally authorized APIs whose terms permit the requested usage.
-type Provider = {
-  name: string; host: string; key: string; base: string;
-  searchPath: string; searchParam: string; videoPath: string; videoParam: string;
-  dailyLimit: number;
-};
-const state = new Map<string, { day: string; used: number; cooldownUntil: number }>();
-const idPattern = /^[a-zA-Z0-9_-]{11}$/;
-const clean = (x: unknown): string => typeof x === "string" ? x : typeof x === "number" ? String(x) : "";
-const object = (x: unknown): Record<string, unknown> =>
-  x && typeof x === "object" && !Array.isArray(x) ? x as Record<string, unknown> : {};
-function configured(name: "PRIMARY" | "SECONDARY"): Provider | null {
-  const p = "RAPIDAPI_" + name + "_";
-  const host = process.env[p + "HOST"] || "";
-  const key = process.env[p + "KEY"] || "";
-  const base = process.env[p + "BASE_URL"] || "";
-  if (!host || !key || !base) return null;
-  // Only HTTPS, configured from trusted server-side environment variables.
-  try { const url = new URL(base); if (url.protocol !== "https:" || url.hostname !== host) return null; } catch { return null; }
-  return { name: name.toLowerCase(), host, key, base,
-    searchPath: process.env[p + "SEARCH_PATH"] || "/search",
-    searchParam: process.env[p + "SEARCH_PARAM"] || "query",
-    videoPath: process.env[p + "VIDEO_PATH"] || "/video",
-    videoParam: process.env[p + "VIDEO_PARAM"] || "id",
-    dailyLimit: Math.max(0, Number(process.env[p + "DAILY_LIMIT"] || 0)),
-  };
-}
-export function providerNames() {
-  return (["PRIMARY", "SECONDARY"] as const).map(configured).filter((x): x is Provider => !!x).map(x => x.name);
-}
-function getState(p: Provider) {
-  const day = new Date().toISOString().slice(0, 10);
-  const current = state.get(p.name);
-  if (!current || current.day !== day) { const fresh = { day, used: 0, cooldownUntil: 0 }; state.set(p.name, fresh); return fresh; }
-  return current;
-}
-function parseDuration(input: unknown) {
-  if (typeof input === "number") {
-    const mins = Math.floor(input / 60), secs = Math.floor(input % 60);
-    return mins + ":" + String(secs).padStart(2, "0");
+type Obj=Record<string,unknown>;
+const obj=(x:unknown):Obj=>x&&typeof x==="object"&&!Array.isArray(x)?x as Obj:{};
+const arr=(x:unknown):unknown[]=>Array.isArray(x)?x:[];
+const string=(x:unknown):string=>typeof x==="string"?x:typeof x==="number"?String(x):"";
+const pick=(x:unknown,...names:string[]):unknown=>{const o=obj(x);for(const n of names)if(o[n]!=null&&o[n]!=="")return o[n];return "";};
+const text=(x:unknown):string=>string(x)||string(pick(x,"text","simpleText","label","name","title","value"));
+const validVideo=/^[A-Za-z0-9_-]{11}$/;
+const validChannel=/^UC[A-Za-z0-9_-]{20,26}$/;
+function image(x:unknown):string{
+  if(typeof x==="string")return x.startsWith("https://")?x:"";
+  if(Array.isArray(x)){
+    const sorted=[...x].sort((a,b)=>Number(obj(b).width||0)-Number(obj(a).width||0));
+    return image(sorted[0]);
   }
-  return clean(input);
+  return image(pick(x,"url","src","high","medium","default","thumbnails","image"));
 }
-function parseOne(input: unknown): Video | null {
-  const r = object(input), videoIdObj = object(r.id), snippet = object(r.snippet), details = object(r.video),
-        channelObj = object(r.channel), thumbs = object(snippet.thumbnails), defaultThumb = object(thumbs.high);
-  const id = clean(r.videoId || videoIdObj.videoId || r.id || details.id || details.videoId || r.video_id);
-  if (!idPattern.test(id)) return null;
-  const titleObj=object(r.title);
-  const title = clean(titleObj.text || r.title || snippet.title || details.title) || "Untitled video";
-  const thumbsArray = Array.isArray(r.thumbnails) ? r.thumbnails : [];
-  const thumbFromArray = thumbsArray.length ? object(thumbsArray[thumbsArray.length-1]).url : "";
-  const thumb = clean(r.thumbnail || r.thumbnailUrl || defaultThumb.url || thumbFromArray || object(r.thumbnails).url) ||
-    "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg";
-  const channel = clean(r.channelName || r.author || r.channelTitle || snippet.channelTitle || channelObj.name || object(r.author).title || details.author) || "YouTube creator";
-  const embedded = r.embeddable ?? object(r.status).embeddable;
-  const kids = r.madeForKids ?? object(r.status).madeForKids;
+function shortCount(x:unknown):string{
+  const v=text(x);if(!v)return "";
+  const n=Number(v);return Number.isFinite(n)&&/^\d+$/.test(v)?Intl.NumberFormat("en",{notation:"compact",maximumFractionDigits:1}).format(n):v;
+}
+function time(x:unknown):string{
+  const v=text(x);
+  if(/^PT/.test(v)){
+    const match=v.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+    if(match){const h=Number(match[1]||0),m=Number(match[2]||0),s=Number(match[3]||0);
+      return (h?h+":":"")+(h?String(m).padStart(2,"0"):m)+":"+String(s).padStart(2,"0");}
+  }
+  if(/^\d+$/.test(v)){const n=Number(v);if(n<86400&&n>0){const h=Math.floor(n/3600),m=Math.floor(n%3600/60),s=n%60;
+    return (h?h+":":"")+(h?String(m).padStart(2,"0"):m)+":"+String(s).padStart(2,"0");}}
+  return v;
+}
+export function normalizeVideo(input:unknown):Video|null{
+  const outer=obj(input),v=obj(outer.video||outer.videoDetails||input),sn=obj(v.snippet);
+  const author=obj(v.author||v.channel),stats=obj(v.stats||v.statistics),status=obj(v.status);
+  const id=text(pick(v,"videoId","id","video_id")||pick(obj(v.id),"videoId"));
+  if(!validVideo.test(id))return null;
+  const title=text(pick(v,"title","name")||sn.title)||"Untitled video";
+  const name=text(pick(author,"title","name","channelName")||pick(v,"channelTitle","channelName","creator","author")||sn.channelTitle)||"YouTube creator";
+  const thumbnails=pick(v,"thumbnails","thumbnail","thumbnailUrl")||sn.thumbnails;
+  const avatar=image(pick(author,"avatar","avatars","thumbnail","thumbnails","picture","image"));
+  const embeddable=pick(v,"embeddable")||status.embeddable;
+  const kids=pick(v,"madeForKids")||status.madeForKids;
   return {
-    id, title, thumbnail: thumb, channel,
-    channelId: clean(r.channelId || snippet.channelId || channelObj.id || object(r.author).channelId),
-    description: clean(r.description || snippet.description || details.description),
-    views: clean(r.viewCount || r.views || object(r.statistics).viewCount || object(r.stats).views),
-    publishedAt: clean(r.publishedAt || snippet.publishedAt || r.uploadDate),
-    duration: parseDuration(r.duration || object(r.contentDetails).duration || r.lengthSeconds),
-    category: clean(r.category) || "All",
-    isShort: r.isShort === true,
-    embeddable: typeof embedded === "boolean" ? embedded : null,
-    madeForKids: typeof kids === "boolean" ? kids : null,
+    id,title,channel:name,channelId:text(pick(author,"channelId","id")||pick(v,"channelId")||sn.channelId),
+    channelAvatar:avatar||image(v.channelThumbnail),
+    subscriberCount:shortCount(pick(author,"subscriberCount","subscriberCountText","subscribers")),
+    description:text(pick(v,"description","descriptionSnippet")||sn.description),
+    thumbnail:image(thumbnails)||"https://i.ytimg.com/vi/"+id+"/hqdefault.jpg",
+    views:shortCount(pick(stats,"views","viewCount","viewCountText")||pick(v,"viewCount","views")),
+    likeCount:shortCount(pick(stats,"likes","likeCount")||pick(v,"likeCount","likes")),
+    commentCount:shortCount(pick(stats,"comments","commentCount")||pick(v,"commentCount","commentsCount")),
+    publishedAt:text(pick(v,"publishedAt","uploadDate")||sn.publishedAt),
+    publishedText:text(pick(v,"publishedTimeText","publishedText","publishedTime")),
+    duration:time(pick(v,"lengthSeconds","duration","lengthText")||pick(v.contentDetails,"duration")),
+    category:text(v.category)||"All",isShort:v.isShort===true||text(v.type)==="short"||string(v.url).includes("/shorts/"),
+    embeddable:typeof embeddable==="boolean"?embeddable:null,madeForKids:typeof kids==="boolean"?kids:null
   };
 }
-export function normalizeResults(payload: unknown): Video[] {
-  if (!payload) return [];
-  const r = object(payload), data = object(r.data), result = object(r.result);
-  const arrays = [payload, r.items, r.videos, r.results, r.contents, data.items, data.videos, data.results, result.items, result.videos];
-  const found = arrays.find(Array.isArray);
-  const rawItems = (Array.isArray(found) ? found : [r.video || r.data || r]) as unknown[];
-  const items = rawItems.map(item => { const wrapper = object(item); return wrapper.type === "video" && wrapper.video ? wrapper.video : item; });
-  const ids = new Set<string>();
-  return items.map(parseOne).filter((v): v is Video => Boolean(v) && !ids.has(v!.id) && Boolean(ids.add(v!.id)));
+export function normalizeChannel(input:unknown):Channel|null{
+  const w=obj(input),v=obj(w.channel||input),stats=obj(v.stats||v.statistics);
+  const id=text(pick(v,"channelId","id"));
+  if(!validChannel.test(id)&&!id.startsWith("@"))return null;
+  return {id,title:text(pick(v,"title","name","channelName"))||"YouTube channel",
+    avatar:image(pick(v,"avatar","avatars","thumbnail","thumbnails","picture","image")),
+    banner:image(pick(v,"banner","banners")),handle:text(pick(v,"handle","username")),
+    description:text(v.description),subscribers:shortCount(pick(stats,"subscribers","subscriberCount")||pick(v,"subscriberCount","subscribers","subscriberCountText")),
+    videos:shortCount(pick(stats,"videoCount","videos")||v.videoCount)};
 }
-async function invoke(p: Provider, type: "search" | "video", value: string): Promise<Video[]> {
-  const s = getState(p);
-  if (s.cooldownUntil > Date.now() || (p.dailyLimit > 0 && s.used >= p.dailyLimit)) return [];
-  const path = type === "search" ? p.searchPath : p.videoPath;
-  if (!path.startsWith("/") || path.startsWith("//")) return [];
-  const url = new URL(path, p.base);
-  if(url.origin !== new URL(p.base).origin) return [];
-  url.searchParams.set(type === "search" ? p.searchParam : p.videoParam, value);
-  s.used++;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6000);
-  try {
-    const res = await fetch(url, {
-      headers: { "x-rapidapi-host": p.host, "x-rapidapi-key": p.key, Accept: "application/json" },
-      cache: "no-store", signal: controller.signal,
-    });
-    if ([401, 403, 429].includes(res.status)) { s.cooldownUntil = Date.now() + (res.status === 429 ? 60_000 : 15 * 60_000); return []; }
-    if (!res.ok) { if (res.status >= 500) s.cooldownUntil = Date.now() + 30_000; return []; }
-    const json: unknown = await res.json();
-    return normalizeResults(json).filter(v => v.embeddable !== false);
-  } catch { s.cooldownUntil = Date.now() + 15_000; return []; }
-  finally { clearTimeout(timeout); }
-}
-export async function lookupVideos({query = "", category = "All", videoId = ""}: {query?: string; category?: string; videoId?: string}) {
-  const providers = (["PRIMARY", "SECONDARY"] as const).map(configured).filter((x): x is Provider => !!x);
-  for (const p of providers) {
-    const isHome = !videoId && !query && category === "All";
-    const results = await invoke(p, videoId ? "video" : "search", videoId || query || (isHome ? "trending" : category));
-    const matching = videoId ? results.filter(x => x.id === videoId) :
-      category === "All" ? results : results.filter(x => x.category === "All" || x.category.toLowerCase() === category.toLowerCase());
-    if (matching.length) return { videos: matching.slice(0, 30), source: "marketplace" as const, provider: p.name };
+export function normalizeResults(payload:unknown):{videos:Video[];channels:Channel[];nextCursor?:string}{
+  const videos:Video[]=[],channels:Channel[]=[],seenV=new Set<string>(),seenC=new Set<string>();
+  const queue:Array<[unknown,number]>=[[payload,0]];
+  let visits=0;
+  while(queue.length&&visits++<700){
+    const [item,depth]=queue.shift()!;
+    if(depth>10||item==null)continue;
+    if(Array.isArray(item)){for(const x of item.slice(0,150))queue.push([x,depth+1]);continue;}
+    const o=obj(item);if(!Object.keys(o).length)continue;
+    const kind=text(o.type).toLowerCase();
+    if(kind==="channel"||o.channel&&!o.video&&kind!=="video"||depth===0){
+      const ch=normalizeChannel(o);if(ch&&!seenC.has(ch.id)){seenC.add(ch.id);channels.push(ch);}
+    }
+    if(kind==="video"||kind==="short"||o.videoId||obj(o.id).videoId||o.videoDetails||depth===0){
+      const v=normalizeVideo(o);if(v&&!seenV.has(v.id)&&v.embeddable!==false){seenV.add(v.id);videos.push(v);}
+    }
+    for(const name of ["contents","items","videos","results","data","result","sections","rows","content","continuation","video","channel","item","shelf","entries","richGrid","grid","videoDetails"]){
+      if(o[name]!=null)queue.push([o[name],depth+1]);
+    }
   }
-  return { videos: videoId ? filterDemo().filter(v => v.id === videoId) : filterDemo(query, category),
-    source: "demo" as const,
-    message: providers.length ? "All configured providers failed, have no results or have exhausted their allowance; showing sample content." :
-      "Sample videos shown. Add an authorized marketplace API provider to enable live search." };
+  const root=obj(payload),d=obj(root.data);
+  const nextCursor=text(pick(root,"cursorNext","nextCursor","nextPageToken")||pick(d,"cursorNext","nextCursor","nextPageToken"));
+  return {videos,channels,nextCursor:nextCursor||undefined};
 }
-// Limits and failure state above are per-server-instance hints, not globally reliable quota accounting.
-// Configure conservative hard limits at EACH marketplace provider; never rotate identities to evade an upstream quota.
+type Provider={name:"primary"|"secondary";host:string;key:string;base:string;dailyLimit:number;
+ searchPath:string;searchParam:string;videoPath:string;videoParam:string};
+const limits=new Map<string,{day:string;used:number;until:number}>();
+function configured(which:"PRIMARY"|"SECONDARY"):Provider|null{
+  const k="RAPIDAPI_"+which+"_";
+  const host=process.env[k+"HOST"]||"",key=process.env[k+"KEY"]||"",base=process.env[k+"BASE_URL"]||"";
+  if(!host||!key||!base)return null;
+  try{const url=new URL(base);if(url.protocol!=="https:"||url.hostname!==host)return null;}catch{return null;}
+  return {name:which.toLowerCase() as "primary"|"secondary",host,key,base,
+    searchPath:process.env[k+"SEARCH_PATH"]||"/search/",searchParam:process.env[k+"SEARCH_PARAM"]||"q",
+    videoPath:process.env[k+"VIDEO_PATH"]||"/video/details/",videoParam:process.env[k+"VIDEO_PARAM"]||"id",
+    dailyLimit:Math.max(0,Number(process.env[k+"DAILY_LIMIT"]||0))};
+}
+const providers=()=> (["PRIMARY","SECONDARY"] as const).map(configured).filter((x):x is Provider=>x!==null);
+export function providerNames(){return providers().map(x=>x.name);}
+async function send(p:Provider,path:string,params:Record<string,string>):Promise<unknown|null>{
+  const day=new Date().toISOString().slice(0,10),existing=limits.get(p.name);
+  const state=existing?.day===day?existing:{day,used:0,until:0};limits.set(p.name,state);
+  if(Date.now()<state.until||(p.dailyLimit>0&&state.used>=p.dailyLimit))return null;
+  if(!path.startsWith("/")||path.startsWith("//"))return null;
+  const url=new URL(path,p.base);if(url.origin!==new URL(p.base).origin)return null;
+  for(const [k,v] of Object.entries(params))if(v)url.searchParams.set(k,v);
+  state.used++;
+  const ctl=new AbortController(),timeout=setTimeout(()=>ctl.abort(),7500);
+  try{
+    const res=await fetch(url,{headers:{"x-rapidapi-host":p.host,"x-rapidapi-key":p.key,Accept:"application/json"},cache:"no-store",signal:ctl.signal});
+    if(!res.ok){if([401,403,429].includes(res.status))state.until=Date.now()+(res.status===429?180000:900000);
+      else if(res.status>=500)state.until=Date.now()+30000;return null;}
+    return await res.json() as unknown;
+  }catch{state.until=Date.now()+30000;return null;}finally{clearTimeout(timeout);}
+}
+export type Mode="home"|"search"|"video"|"channel"|"channelVideos"|"suggest"|"related";
+export async function remote(mode:Mode,arg="",cursor=""):Promise<{data:unknown;provider:string}|null>{
+  for(const p of providers()){
+    const isYT=p.host==="youtube138.p.rapidapi.com";
+    let path:string,params:Record<string,string>;
+    if(mode==="video"){path=p.videoPath;params={[p.videoParam]:arg};}
+    else if(mode==="search"){path=p.searchPath;params={[p.searchParam]:arg,cursor};}
+    else if(mode==="home"){path=isYT?"/home/":p.searchPath;params=isYT?{cursor}:{[p.searchParam]:"popular videos"};}
+    else if(!isYT)continue;
+    else if(mode==="channel"){path="/channel/details/";params={id:arg};}
+    else if(mode==="channelVideos"){path="/channel/videos/";params={id:arg,filter:"videos_latest",cursor};}
+    else if(mode==="suggest"){path="/auto-complete/";params={q:arg};}
+    else {path="/video/related-contents/";params={id:arg,cursor};}
+    const data=await send(p,path,params);
+    if(data!==null)return {data,provider:p.name};
+  }
+  return null;
+}
+export async function lookupVideos({query="",category="All",videoId="",channelId="",relatedId="",cursor=""}:{
+  query?:string;category?:string;videoId?:string;channelId?:string;relatedId?:string;cursor?:string
+}):Promise<VideoResponse>{
+  const mode:Mode=videoId?"video":channelId?"channelVideos":relatedId?"related":query||category!=="All"?"search":"home";
+  const term=videoId||channelId||relatedId||query||(category==="All"?"":category);
+  const found=await remote(mode,term,cursor);
+  if(found){const normalized=normalizeResults(found.data);
+    if(normalized.videos.length||normalized.channels.length)return {...normalized,source:"marketplace",provider:found.provider};}
+  if(videoId||query||channelId||relatedId)return {videos:[],channels:[],source:"demo",message:"No live results returned. Check the RapidAPI subscription, quota and API responses."};
+  return {videos:filterDemo("",category),channels:[],source:"demo",message:"Live feed unavailable, showing a limited sample catalog."};
+}
+export async function lookupChannel(id:string):Promise<Channel|null>{
+  const found=await remote("channel",id);if(!found)return null;
+  return normalizeChannel(found.data)||normalizeResults(found.data).channels[0]||null;
+}
+export async function lookupSuggestions(q:string):Promise<string[]>{
+  const found=await remote("suggest",q);if(!found)return [];
+  const r=obj(found.data);
+  const source=[found.data,r.results,r.suggestions,r.queries,r.items,r.data,obj(r.data).suggestions].find(Array.isArray);
+  if(!source)return [];
+  return [...new Set(arr(source).map(x=>text(x)||text(pick(x,"query","suggestion"))).filter(v=>v&&v.length<130))].slice(0,8);
+}
+// IMPORTANT: This is a per-instance soft limit, not a global quota. Restrict usage and
+// spending in the RapidAPI dashboard; never use fallback APIs to bypass provider limits.

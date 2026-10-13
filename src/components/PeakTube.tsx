@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Menu, Search, Moon, Sun, Home, Clapperboard, History, Bookmark, ThumbsUp, Music, Gamepad2, UserRound, LogOut, ArrowDown, ArrowUp, Heart, Share2, Play, Bell, Library, Compass, LoaderCircle } from "lucide-react";
 import { getSupabase, isSupabaseConfigured } from "@/lib/supabase";
 import { demoVideos } from "@/lib/demo";
@@ -34,6 +34,15 @@ export default function PeakTube() {
   const [busy,setBusy] = useState(false);
   const [active,setActive] = useState<Video>(demoVideos[0]);
   const [shortIndex,setShortIndex] = useState(0);
+  const [shorts,setShorts] = useState<Video[]>([]);
+  const [shortCursor,setShortCursor] = useState("");
+  const [shortLoading,setShortLoading] = useState(false);
+  const [related,setRelated] = useState<Video[]>([]);
+  const [providerHealth,setProviderHealth] = useState("");
+  const loadSentinel=useRef<HTMLDivElement|null>(null);
+  const loadMoreRef=useRef<()=>void>(()=>{});
+  const isMoreLoading=useRef(false);
+  const staleLoad=useRef(0);
   const [user,setUser] = useState<User|null>(null);
   const [library,setLibrary] = useState<LibraryRow[]>([]);
   const [subscriptions,setSubscriptions] = useState<SubscriptionRow[]>([]);
@@ -68,20 +77,69 @@ export default function PeakTube() {
   useEffect(()=>{void refreshLibrary(user);},[user,refreshLibrary]);
   const loadVideos=useCallback(async(q="",cat="All")=>{
     setBusy(true);
+    const ticket=++staleLoad.current;
     try {
       const params = new URLSearchParams({q,category:cat});
       const response = await fetch("/api/videos?"+params.toString());
       if(!response.ok)throw Error("Request failed");
       const result:VideoResponse = await response.json();
+      if(ticket!==staleLoad.current)return;
       setVideos(result.videos);setChannels(result.channels||[]);setCursor(result.nextCursor||"");setOrigin(result.source);setSourceMessage(result.message||"");
-    } catch {setVideos(demoVideos);setOrigin("demo");setSourceMessage("Video service unavailable. Showing samples.");}
+    } catch {if(ticket===staleLoad.current){setVideos(demoVideos);setOrigin("demo");setSourceMessage("Video service unavailable. Check /api/health and Vercel settings.");}}
     finally{setBusy(false);}
   },[]);
   useEffect(()=>{void loadVideos();},[loadVideos]);
   const navigate=(p:Page)=>{setPage(p);if(p==="home"){setCategory("All");setQuery("");setDraft("");void loadVideos();}window.scrollTo({top:0,behavior:"smooth"});};
   const runSearch=(term:string)=>{setDraft(term);setQuery(term);setShowSuggestions(false);setCategory("All");setPage("home");void loadVideos(term,"All");};
   const search=(event:FormEvent)=>{event.preventDefault();runSearch(draft.trim());};
-  async function loadMore(){if(!cursor)return;setBusy(true);try{const p=new URLSearchParams({q:query,category,cursor});const r=await fetch("/api/videos?"+p);const result:VideoResponse=await r.json();setVideos(v=>[...v,...result.videos.filter(n=>!v.some(old=>old.id===n.id))]);setChannels(v=>[...v,...(result.channels||[]).filter(n=>!v.some(old=>old.id===n.id))]);setCursor(result.nextCursor||"");}catch{notify("Could not load more videos.");}finally{setBusy(false);}}
+  async function loadMore(){
+    if(!cursor||isMoreLoading.current)return;
+    isMoreLoading.current=true;
+    try{
+      const p=new URLSearchParams({q:query,category,cursor});
+      const r=await fetch("/api/videos?"+p.toString());
+      if(!r.ok)throw new Error("Request failed");
+      const result:VideoResponse=await r.json();
+      setVideos(old=>{const existing=new Set(old.map(v=>v.id));return [...old,...result.videos.filter(v=>!existing.has(v.id))]});
+      setChannels(old=>{const ids=new Set(old.map(v=>v.id));return [...old,...(result.channels||[]).filter(v=>!ids.has(v.id))]});
+      setCursor(result.nextCursor&&result.nextCursor!==cursor?result.nextCursor:"");
+    }catch{notify("Could not fetch the next page of videos.");}
+    finally{isMoreLoading.current=false;}
+  }
+  loadMoreRef.current=()=>{void loadMore();};
+  useEffect(()=>{
+    if(page!=="home"||!cursor)return;
+    const target=loadSentinel.current;if(!target)return;
+    const observer=new IntersectionObserver(entries=>{if(entries[0]?.isIntersecting)loadMoreRef.current();},{rootMargin:"900px"});
+    observer.observe(target);return ()=>observer.disconnect();
+  },[page,cursor,videos.length]);
+  const loadShorts=useCallback(async(next="")=>{
+    setShortLoading(true);
+    try{
+      const p=new URLSearchParams({feed:"shorts"});if(next)p.set("cursor",next);
+      const r=await fetch("/api/videos?"+p);if(!r.ok)throw Error();
+      const result:VideoResponse=await r.json();
+      const valid=result.videos.filter(v=>v.isShort);
+      setShorts(old=>next?[...old,...valid.filter(v=>!old.some(x=>x.id===v.id))]:valid);
+      setShortCursor(result.nextCursor&&result.nextCursor!==next?result.nextCursor:"");
+    }catch{if(!next)setShorts([]);setShortCursor("");}
+    finally{setShortLoading(false);}
+  },[]);
+  useEffect(()=>{if(page==="shorts"&&shorts.length===0)void loadShorts();},[page,loadShorts,shorts.length]);
+  useEffect(()=>{if(page==="shorts"&&shortCursor&&!shortLoading&&shortIndex>=shorts.length-3)void loadShorts(shortCursor);},[page,shortIndex,shortCursor,shortLoading,shorts.length,loadShorts]);
+  useEffect(()=>{if(page!=="watch")return;let cancelled=false;
+    fetch("/api/videos?relatedId="+encodeURIComponent(active.id)).then(r=>r.json()).then((d:VideoResponse)=>{if(!cancelled)setRelated((d.videos||[]).filter(x=>x.id!==active.id));}).catch(()=>{if(!cancelled)setRelated([])});
+    return ()=>{cancelled=true};
+  },[page,active.id]);
+  useEffect(()=>{fetch("/api/health").then(r=>r.json()).then(data=>{
+    const state=data.videoProvider;
+    if(!state?.configured)setProviderHealth("No RapidAPI provider configured on this deployment.");
+    else{const p=state.configuredProviders||[];
+      const bad=p.filter((x:{state:string})=>x.state.startsWith("upstream_http_")||x.state==="cooldown"||x.state==="local_limit_reached");
+      setProviderHealth(bad.length?"Video provider reports: "+bad.map((x:{state:string})=>x.state).join(", "):"");
+    }
+  }).catch(()=>{});
+  },[]);
   async function openChannel(channel:Channel){setSelectedChannel(channel);setPage("channel");setChannelVideos([]);window.scrollTo(0,0);try{const [detail,items]=await Promise.all([fetch("/api/channels?id="+encodeURIComponent(channel.id)).then(r=>r.json()),fetch("/api/videos?channelId="+encodeURIComponent(channel.id)).then(r=>r.json())]);setSelectedChannel(detail.channel||channel);setChannelVideos(items.videos||[]);}catch{notify("Channel information is unavailable.");}}
   const openVideoChannel=(v:Video)=>{if(!v.channelId){notify("This provider did not return a channel ID.");return;}void openChannel({id:v.channelId,title:v.channel,avatar:v.channelAvatar||"",subscribers:v.subscriberCount});};
   const selectCategory=(cat:string)=>{setCategory(cat);setQuery("");setDraft("");setPage("home");void loadVideos("",cat);};
@@ -103,10 +161,7 @@ export default function PeakTube() {
   const currentVideo = useCallback((row:LibraryRow):Video=>knownVideo(row.video_id)||{
     id:row.video_id,title:row.title,thumbnail:row.thumbnail,channel:row.channel,channelId:"",description:"",views:"",publishedAt:"",duration:"",category:"All",isShort:false,embeddable:null,madeForKids:null
   },[videos]);
-  const eligible = videos.filter(v=>v.embeddable!==false);
-  const shortVideos = eligible.filter(v=>v.isShort);
-  const shorts = shortVideos.length?shortVideos:eligible;
-  const short=shorts[shortIndex%Math.max(1,shorts.length)];
+  const short=shorts[shortIndex];
   const libraryVideos=useMemo(()=>{
     if(page==="subscriptions")return videos.filter(v=>subscriptions.some(s=>s.channel_id===v.channelId&&(v.channelId!=="")));
     return library.filter(x=>x.kind===page).map(currentVideo);
@@ -176,19 +231,19 @@ export default function PeakTube() {
     <main className="content">
       {page==="home"&&<><div className="chips">{categories.map(c=><button key={c} className={"chip "+(category===c?"active":"")} onClick={()=>selectCategory(c)}>{c}</button>)}</div>
       {query&&<p className="section-desc">Search results for “{query}”</p>}
-      {origin==="demo"&&<div className="notice">{sourceMessage||"Preview catalog. Configure a marketplace API to enable live video search."}</div>}
+      {origin==="demo"&&<div className="notice">{sourceMessage||"Sample catalog — live data unavailable."} {providerHealth&&<span>{providerHealth} </span>}<a href="/api/health" target="_blank" rel="noreferrer">Check API status</a></div>}
       {channels.length>0&&<div className="channel-results">{channels.map(ch=><button className="channel-result" key={ch.id} onClick={()=>void openChannel(ch)}><div className="channel-result-avatar">{ch.avatar?<img src={ch.avatar} alt=""/>:initial(ch.title)}</div><div><strong>{ch.title}</strong><p>{[ch.handle,ch.subscribers?ch.subscribers+" subscribers":""].filter(Boolean).join(" · ")}</p><small>{ch.description}</small></div></button>)}</div>}
-      {busy?<p className="section-desc"><LoaderCircle size={15}/> Loading videos…</p>:videos.length?<div className="video-grid">{videos.map(v=><VideoCard key={v.id} video={v} onOpen={openVideo} onChannel={openVideoChannel} onSave={v=>void upsertAction("saved",v)}/>)}</div>:<div className="empty">No videos found. Try another search.</div>}{cursor&&<div style={{textAlign:"center",marginTop:28}}><button className="action" disabled={busy} onClick={()=>void loadMore()}>Load more videos ↓</button></div>}</>}
+      {busy?<p className="section-desc"><LoaderCircle size={15}/> Loading videos…</p>:videos.length?<div className="video-grid">{videos.map(v=><VideoCard key={v.id} video={v} onOpen={openVideo} onChannel={openVideoChannel} onSave={v=>void upsertAction("saved",v)}/>)}</div>:<div className="empty">No videos found. Try another search.</div>}{cursor&&<div ref={loadSentinel} style={{textAlign:"center",marginTop:28,padding:24}}><button className="action" onClick={()=>void loadMore()}>Load more videos ↓</button></div>}</>}
       {page==="watch"&&<div className="watch-layout"><section>
         <iframe className="player" title={active.title} key={active.id} src={"https://www.youtube-nocookie.com/embed/"+active.id+"?enablejsapi=1&origin="+encodeURIComponent(typeof window!=="undefined"?window.location.origin:"")} allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerPolicy="strict-origin-when-cross-origin" allowFullScreen/>
         <h1 className="watch-title">{active.title}</h1><div className="watch-details"><button className="circle" style={{padding:0,border:0,overflow:"hidden"}} onClick={()=>openVideoChannel(active)}>{active.channelAvatar?<img src={active.channelAvatar} alt="" style={{height:"100%",width:"100%",objectFit:"cover"}}/>:initial(active.channel)}</button><div><button className="channel-link" onClick={()=>openVideoChannel(active)}><strong>{active.channel}</strong></button><div className="meta">{active.subscriberCount?active.subscriberCount+" subscribers":""}</div></div><button className="primary" onClick={()=>void toggleSubscribe(active)}>{subscriptions.some(s=>s.channel_id===active.channelId&&!!active.channelId)?"Subscribed":"Subscribe"}</button><div className="space"/><button className={"action "+(library.some(x=>x.video_id===active.id&&x.kind==="liked")?"on":"")} onClick={()=>void upsertAction("liked",active)}><Heart size={14}/> {active.likeCount||"Like"}</button><button className="action" onClick={()=>void upsertAction("saved",active)}><Bookmark size={14}/> Save</button><button className="action" onClick={()=>{void navigator.clipboard?.writeText(window.location.origin+"?v="+active.id);notify("Video link copied.");}}><Share2 size={14}/> Share</button></div>
         <div className="info"><strong>{[active.views?active.views+" views":"",active.publishedText||formatDate(active.publishedAt)].filter(Boolean).join(" · ")}</strong>{"\n"}{active.description||"Watch this video on YouTube through the official embedded player."}{watchPosition>0?"\nLast known position: "+Math.floor(watchPosition)+"s":""}</div>
         <div className="comments"><h3>PeakTube comments</h3>{active.madeForKids===true?<p className="section-desc">Comments are disabled for videos marked Made for Kids.</p>:<><form className="comment-form" onSubmit={e=>void submitComment(e)}><input value={comment} onChange={e=>setComment(e.target.value)} placeholder={user?"Add a comment…":"Sign in to comment"} maxLength={1000}/><button className="primary" type="submit">Comment</button></form>{comments.map(c=><div className="comment" key={c.id}><strong>{c.user_id===user?.id?"You":"Community member"}</strong><p>{c.body}</p></div>)}</>}</div>
-      </section><aside className="suggestions"><h3>Up next</h3>{videos.filter(v=>v.id!==active.id).slice(0,10).map(v=><button className="suggestion" key={v.id} onClick={()=>openVideo(v)}><img src={v.thumbnail} alt=""/><span><strong>{v.title}</strong><small>{v.channel}<br/>{v.views}</small></span></button>)}</aside></div>}
+      </section><aside className="suggestions"><h3>Up next</h3>{(related.length?related:videos.filter(v=>v.id!==active.id)).slice(0,24).map(v=><button className="suggestion" key={v.id} onClick={()=>openVideo(v)}><img src={v.thumbnail} alt=""/><span><strong>{v.title}</strong><small>{v.channel}<br/>{v.views}</small></span></button>)}</aside></div>}
       {page==="channel"&&selectedChannel&&<><div className="channel-banner">{selectedChannel.banner&&<img src={selectedChannel.banner} alt=""/>}</div><div className="channel-profile"><div className="channel-profile-avatar">{selectedChannel.avatar?<img src={selectedChannel.avatar} alt=""/>:initial(selectedChannel.title)}</div><div><h1>{selectedChannel.title}</h1><p>{[selectedChannel.handle,selectedChannel.subscribers?selectedChannel.subscribers+" subscribers":"",selectedChannel.videos?selectedChannel.videos+" videos":""].filter(Boolean).join(" · ")}</p><p>{selectedChannel.description}</p></div></div><h2 className="section-title">Videos</h2>{channelVideos.length?<div className="video-grid">{channelVideos.map(v=><VideoCard key={v.id} video={v} onOpen={openVideo} onChannel={openVideoChannel} onSave={v=>void upsertAction("saved",v)}/>)}</div>:<div className="empty">No channel videos are available from the connected provider.</div>}</>}
-      {page==="shorts"&&<><h1 className="section-title">Shorts</h1><p className="section-desc">Swipe through short-form videos. Use the arrows to move between videos.</p>{short?<div className="shorts-layout"><div className="short-item" onTouchStart={e=>{e.currentTarget.dataset.y=String(e.touches[0].clientY)}} onTouchEnd={e=>{const diff=Number(e.currentTarget.dataset.y||0)-e.changedTouches[0].clientY;if(Math.abs(diff)>50)setShortIndex(i=>(i+(diff>0?1:shorts.length-1))%shorts.length);}}>
+      {page==="shorts"&&<><h1 className="section-title">Shorts</h1><p className="section-desc">Swipe through short-form videos. Use the arrows to move between videos.</p>{short?<div className="shorts-layout"><div className="short-item" onTouchStart={e=>{e.currentTarget.dataset.y=String(e.touches[0].clientY)}} onTouchEnd={e=>{const diff=Number(e.currentTarget.dataset.y||0)-e.changedTouches[0].clientY;if(Math.abs(diff)>50)setShortIndex(i=>Math.max(0,Math.min(shorts.length-1,i+(diff>0?1:-1))));}}>
         <iframe title={short.title} key={short.id} src={"https://www.youtube-nocookie.com/embed/"+short.id+"?playsinline=1"} allow="autoplay; encrypted-media; picture-in-picture" allowFullScreen/>
-      </div><div className="short-actions"><button title="Like" onClick={()=>void upsertAction("liked",short)}><Heart/></button><button title="Save" onClick={()=>void upsertAction("saved",short)}><Bookmark/></button><button title="Previous" onClick={()=>setShortIndex(i=>(i+shorts.length-1)%shorts.length)}><ArrowUp/></button><button title="Next" onClick={()=>setShortIndex(i=>(i+1)%shorts.length)}><ArrowDown/></button></div></div>:<div className="empty">No available short-form videos.</div>}{!shortVideos.length&&<p className="section-desc" style={{textAlign:"center",marginTop:18}}>Showing the available video catalog in Shorts preview. Live short-form results need provider support.</p>}</>}
+      </div><div className="short-actions"><button title="Like" onClick={()=>void upsertAction("liked",short)}><Heart/></button><button title="Save" onClick={()=>void upsertAction("saved",short)}><Bookmark/></button><button title="Previous" onClick={()=>setShortIndex(i=>Math.max(0,i-1))}><ArrowUp/></button><button title="Next" onClick={()=>setShortIndex(i=>Math.min(shorts.length-1,i+1))}><ArrowDown/></button></div></div>:<div className="empty">No available short-form videos.</div>}{!shorts.length&&<p className="section-desc" style={{textAlign:"center",marginTop:18}}>Only provider-confirmed Shorts can appear here. No confirmed Shorts are available right now.</p>}{shortLoading&&<p className="section-desc" style={{textAlign:"center"}}>Loading Shorts…</p>}</>}
       {["history","saved","liked","subscriptions"].includes(page)&&<><h1 className="section-title">{({history:"History",saved:"Watch Later",liked:"Liked videos",subscriptions:"Subscriptions"} as Record<string,string>)[page]}</h1><p className="section-desc">Your personal library is synchronized across devices when signed in.</p>{!user&&<div className="notice">Sign in to access your saved activity. <button className="action" onClick={()=>navigate("account")}>Sign in</button></div>}{libraryVideos.length?<div className="video-grid">{libraryVideos.map(v=><VideoCard key={v.id} video={v} onOpen={openVideo} onSave={v=>void upsertAction("saved",v)}/>)}</div>:<div className="empty">Nothing here yet. Browse videos and build your library.<p><button className="primary" onClick={()=>navigate("home")}>Explore videos</button></p></div>}</>}
       {page==="account"&&<div className="auth-panel"><h2>Welcome to PeakTube</h2>{user?<><p>Signed in as <strong>{user.email}</strong>. Your history, liked videos, saved videos and subscriptions are available across devices.</p><div className="account-options"><button className="primary" onClick={()=>navigate("saved")}>Open library</button><button className="action" onClick={()=>void signOut()}><LogOut size={16}/> Sign out</button></div></>:<><p>Sign in to synchronize history, saved videos and subscriptions. Browsing and watching are available without an account.</p>{isSupabaseConfigured()?<><form onSubmit={e=>{e.preventDefault();void signIn();}}><p>Or get a sign-in link by email:</p><input required type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com"/><button disabled={authBusy} className="action" type="submit">Send magic link</button></form></>:<div className="notice">Authentication needs Supabase credentials. Follow README setup steps.</div>}</>}</div>}
     </main></div>{message&&<div className="status" role="status">{message}</div>}

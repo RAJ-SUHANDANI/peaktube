@@ -3,15 +3,18 @@ import { lookupVideos } from "@/lib/providers";
 
 export const runtime = "nodejs";
 export async function GET(request: NextRequest) {
-  const { searchParams } = request.nextUrl;
-  const query = (searchParams.get("q") || "").slice(0, 120).trim();
-  const category = (searchParams.get("category") || "All").slice(0, 40);
-  const videoId = searchParams.get("id") || "";
-  if (videoId && !/^[\w-]{11}$/.test(videoId)) {
-    return NextResponse.json({ error: "Invalid video id" }, { status: 400 });
-  }
-  const data = await lookupVideos({query, category, videoId});
-  return NextResponse.json(data, {
-    headers: { "Cache-Control": data.source === "marketplace" ? "public, s-maxage=180, stale-while-revalidate=60" : "no-store" }
-  });
+  const p=request.nextUrl.searchParams;
+  const query=(p.get("q")||"").slice(0,120).trim();
+  const category=(p.get("category")||"All").slice(0,40);
+  const videoId=(p.get("id")||"").slice(0,100);
+  const channelId=(p.get("channelId")||"").slice(0,120);
+  const relatedId=(p.get("relatedId")||"").slice(0,100);
+  const cursor=(p.get("cursor")||"").slice(0,1200);
+  if((videoId&&!/^[\w-]{11}$/.test(videoId))||(relatedId&&!/^[\w-]{11}$/.test(relatedId)))
+    return NextResponse.json({error:"Invalid video ID"},{status:400});
+  if(channelId&&!/^UC[A-Za-z0-9_-]{20,26}$/.test(channelId)&&!/^@[A-Za-z0-9._-]{1,60}$/.test(channelId))
+    return NextResponse.json({error:"Invalid channel ID"},{status:400});
+  const result=await lookupVideos({query,category,videoId,channelId,relatedId,cursor});
+  return NextResponse.json(result,{headers:{"Cache-Control":result.source==="marketplace"?
+    "public, s-maxage=60, stale-while-revalidate=60":"no-store"}});
 }

@@ -10,11 +10,12 @@ export async function GET(request: NextRequest) {
   const channelId=(p.get("channelId")||"").slice(0,120);
   const relatedId=(p.get("relatedId")||"").slice(0,100);
   const cursor=(p.get("cursor")||"").slice(0,1200);
+  const feed=p.get("feed")==="shorts"?"shorts":"";
   if((videoId&&!/^[\w-]{11}$/.test(videoId))||(relatedId&&!/^[\w-]{11}$/.test(relatedId)))
     return NextResponse.json({error:"Invalid video ID"},{status:400});
   if(channelId&&!/^UC[A-Za-z0-9_-]{20,26}$/.test(channelId)&&!/^@[A-Za-z0-9._-]{1,60}$/.test(channelId))
     return NextResponse.json({error:"Invalid channel ID"},{status:400});
-  const result=await lookupVideos({query,category,videoId,channelId,relatedId,cursor});
+  const result=await lookupVideos({query,category,videoId,channelId,relatedId,cursor,feed});
   return NextResponse.json(result,{headers:{"Cache-Control":result.source==="marketplace"?
     "public, s-maxage=60, stale-while-revalidate=60":"no-store"}});
 }

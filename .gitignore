@@ -1,0 +1,13 @@
+# Local environment and credentials (NEVER commit these)
+.env*
+*.env
+*.env.*
+
+# Dependencies and build artifacts
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+coverage/
+.DS_Store

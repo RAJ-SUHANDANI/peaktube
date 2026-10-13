@@ -55,7 +55,7 @@ export function normalizeVideo(input:unknown):Video|null{
     publishedAt:text(pick(v,"publishedAt","uploadDate")||sn.publishedAt),
     publishedText:text(pick(v,"publishedTimeText","publishedText","publishedTime")),
     duration:time(pick(v,"lengthSeconds","duration","lengthText")||pick(v.contentDetails,"duration")),
-    category:text(v.category)||"All",isShort:v.isShort===true||text(v.type)==="short"||string(v.url).includes("/shorts/"),
+    category:text(v.category)||"All",isShort:v.isShort===true||text(v.type).toLowerCase()==="short"||string(v.url).includes("/shorts/")||text(pick(v,"videoType","contentType")).toLowerCase()==="shorts",
     embeddable:typeof embeddable==="boolean"?embeddable:null,madeForKids:typeof kids==="boolean"?kids:null
   };
 }
@@ -83,7 +83,7 @@ export function normalizeResults(payload:unknown):{videos:Video[];channels:Chann
       const ch=normalizeChannel(o);if(ch&&!seenC.has(ch.id)){seenC.add(ch.id);channels.push(ch);}
     }
     if(kind==="video"||kind==="short"||o.videoId||obj(o.id).videoId||o.videoDetails||depth===0){
-      const v=normalizeVideo(o);if(v&&!seenV.has(v.id)&&v.embeddable!==false){seenV.add(v.id);videos.push(v);}
+      const v=normalizeVideo(o);if(v&&!seenV.has(v.id)&&v.embeddable!==false){if(kind==="short")v.isShort=true;seenV.add(v.id);videos.push(v);}
     }
     // Traverse wrapper object variants from upstream including nested renderer/shelf structures.
     for(const [name,value] of Object.entries(o)){

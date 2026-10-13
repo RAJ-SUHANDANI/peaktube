@@ -73,9 +73,9 @@ export function normalizeResults(payload:unknown):{videos:Video[];channels:Chann
   const videos:Video[]=[],channels:Channel[]=[],seenV=new Set<string>(),seenC=new Set<string>();
   const queue:Array<[unknown,number]>=[[payload,0]];
   let visits=0;
-  while(queue.length&&visits++<700){
+  while(queue.length&&visits++<3000){
     const [item,depth]=queue.shift()!;
-    if(depth>10||item==null)continue;
+    if(depth>15||item==null)continue;
     if(Array.isArray(item)){for(const x of item.slice(0,150))queue.push([x,depth+1]);continue;}
     const o=obj(item);if(!Object.keys(o).length)continue;
     const kind=text(o.type).toLowerCase();
@@ -85,17 +85,46 @@ export function normalizeResults(payload:unknown):{videos:Video[];channels:Chann
     if(kind==="video"||kind==="short"||o.videoId||obj(o.id).videoId||o.videoDetails||depth===0){
       const v=normalizeVideo(o);if(v&&!seenV.has(v.id)&&v.embeddable!==false){seenV.add(v.id);videos.push(v);}
     }
-    for(const name of ["contents","items","videos","results","data","result","sections","rows","content","continuation","video","channel","item","shelf","entries","richGrid","grid","videoDetails"]){
-      if(o[name]!=null)queue.push([o[name],depth+1]);
+    // Traverse wrapper object variants from upstream including nested renderer/shelf structures.
+    for(const [name,value] of Object.entries(o)){
+      if(value!=null&&typeof value==="object"&&name!=="thumbnails"&&name!=="statistics"&&name!=="stats"&&name!=="author"&&name!=="avatar"&&name!=="description"&&name!=="metadata")
+        queue.push([value,depth+1]);
     }
   }
   const root=obj(payload),d=obj(root.data);
-  const nextCursor=text(pick(root,"cursorNext","nextCursor","nextPageToken")||pick(d,"cursorNext","nextCursor","nextPageToken"));
+  const direct=text(pick(root,"cursorNext","nextCursor","nextPageToken","continuationToken")||pick(d,"cursorNext","nextCursor","nextPageToken","continuationToken"));
+  let nextCursor=direct;
+  if(!nextCursor){
+    const todo:Array<[unknown,number]>=[[payload,0]];
+    let n=0;
+    while(todo.length&&n++<350){
+      const [candidate,depth]=todo.shift()!;
+      if(depth>8||candidate==null)continue;
+      if(Array.isArray(candidate)){for(const x of candidate.slice(0,35))todo.push([x,depth+1]);continue;}
+      const x=obj(candidate);
+      nextCursor=text(pick(x,"cursorNext","nextCursor","nextPageToken","continuationToken","continuation"));
+      if(nextCursor)break;
+      for(const key of ["continuations","continuation","next","pagination","data","response","contents","items"]){
+        if(x[key]!=null&&typeof x[key]==="object")todo.push([x[key],depth+1]);
+      }
+    }
+  }
   return {videos,channels,nextCursor:nextCursor||undefined};
 }
 type Provider={name:"primary"|"secondary";host:string;key:string;base:string;dailyLimit:number;
  searchPath:string;searchParam:string;videoPath:string;videoParam:string};
 const limits=new Map<string,{day:string;used:number;until:number}>();
+const diagnostics=new Map<string,{lastStatus:string;at:string}>();
+const note=(p:Provider,status:string)=>diagnostics.set(p.name,{lastStatus:status,at:new Date().toISOString()});
+export function providerDiagnostics(){
+  const configuredProviders=providers();
+  return {configuredProviders:configuredProviders.map(p=>({
+    name:p.name,host:p.host,
+    state:diagnostics.get(p.name)?.lastStatus||"configured_not_tested",
+    lastChecked:diagnostics.get(p.name)?.at||null,
+    cooldownActive:(limits.get(p.name)?.until||0)>Date.now()
+  })),configured:configuredProviders.length>0,environment:"server"};
+}
 function configured(which:"PRIMARY"|"SECONDARY"):Provider|null{
   const k="RAPIDAPI_"+which+"_";
   const host=process.env[k+"HOST"]||"",key=process.env[k+"KEY"]||"",base=process.env[k+"BASE_URL"]||"";
@@ -111,7 +140,8 @@ export function providerNames(){return providers().map(x=>x.name);}
 async function send(p:Provider,path:string,params:Record<string,string>):Promise<unknown|null>{
   const day=new Date().toISOString().slice(0,10),existing=limits.get(p.name);
   const state=existing?.day===day?existing:{day,used:0,until:0};limits.set(p.name,state);
-  if(Date.now()<state.until||(p.dailyLimit>0&&state.used>=p.dailyLimit))return null;
+  if(Date.now()<state.until){note(p,"cooldown");return null;}
+  if(p.dailyLimit>0&&state.used>=p.dailyLimit){note(p,"local_limit_reached");return null;}
   if(!path.startsWith("/")||path.startsWith("//"))return null;
   const url=new URL(path,p.base);if(url.origin!==new URL(p.base).origin)return null;
   for(const [k,v] of Object.entries(params))if(v)url.searchParams.set(k,v);
@@ -119,19 +149,20 @@ async function send(p:Provider,path:string,params:Record<string,string>):Promise
   const ctl=new AbortController(),timeout=setTimeout(()=>ctl.abort(),7500);
   try{
     const res=await fetch(url,{headers:{"x-rapidapi-host":p.host,"x-rapidapi-key":p.key,Accept:"application/json"},cache:"no-store",signal:ctl.signal});
-    if(!res.ok){if([401,403,429].includes(res.status))state.until=Date.now()+(res.status===429?180000:900000);
+    if(!res.ok){note(p,"upstream_http_"+res.status);if([401,403,429].includes(res.status))state.until=Date.now()+(res.status===429?180000:900000);
       else if(res.status>=500)state.until=Date.now()+30000;return null;}
-    return await res.json() as unknown;
-  }catch{state.until=Date.now()+30000;return null;}finally{clearTimeout(timeout);}
+    const payload=await res.json() as unknown;note(p,"upstream_ok");return payload;
+  }catch{note(p,"network_timeout_or_error");state.until=Date.now()+30000;return null;}finally{clearTimeout(timeout);}
 }
-export type Mode="home"|"search"|"video"|"channel"|"channelVideos"|"suggest"|"related";
+export type Mode="home"|"trending"|"search"|"video"|"channel"|"channelVideos"|"suggest"|"related";
 export async function remote(mode:Mode,arg="",cursor=""):Promise<{data:unknown;provider:string}|null>{
   for(const p of providers()){
     const isYT=p.host==="youtube138.p.rapidapi.com";
     let path:string,params:Record<string,string>;
     if(mode==="video"){path=p.videoPath;params={[p.videoParam]:arg};}
     else if(mode==="search"){path=p.searchPath;params={[p.searchParam]:arg,cursor};}
-    else if(mode==="home"){path=isYT?"/home/":p.searchPath;params=isYT?{cursor}:{[p.searchParam]:"popular videos"};}
+    else if(mode==="home"){path=isYT?"/home/":p.searchPath;params=isYT?{cursor,hl:"en",gl:"IN"}:{[p.searchParam]:"popular videos"};}
+    else if(mode==="trending"){if(!isYT)continue;path="/v2/trending";params={};}
     else if(!isYT)continue;
     else if(mode==="channel"){path="/channel/details/";params={id:arg};}
     else if(mode==="channelVideos"){path="/channel/videos/";params={id:arg,filter:"videos_latest",cursor};}
@@ -142,16 +173,31 @@ export async function remote(mode:Mode,arg="",cursor=""):Promise<{data:unknown;p
   }
   return null;
 }
-export async function lookupVideos({query="",category="All",videoId="",channelId="",relatedId="",cursor=""}:{
-  query?:string;category?:string;videoId?:string;channelId?:string;relatedId?:string;cursor?:string
+export async function lookupVideos({query="",category="All",videoId="",channelId="",relatedId="",cursor="",feed=""}:{
+  query?:string;category?:string;videoId?:string;channelId?:string;relatedId?:string;cursor?:string;feed?:string
 }):Promise<VideoResponse>{
-  const mode:Mode=videoId?"video":channelId?"channelVideos":relatedId?"related":query||category!=="All"?"search":"home";
-  const term=videoId||channelId||relatedId||query||(category==="All"?"":category);
-  const found=await remote(mode,term,cursor);
-  if(found){const normalized=normalizeResults(found.data);
-    if(normalized.videos.length||normalized.channels.length)return {...normalized,source:"marketplace",provider:found.provider};}
-  if(videoId||query||channelId||relatedId)return {videos:[],channels:[],source:"demo",message:"No live results returned. Check the RapidAPI subscription, quota and API responses."};
-  return {videos:filterDemo("",category),channels:[],source:"demo",message:"Live feed unavailable, showing a limited sample catalog."};
+  const mode:Mode=videoId?"video":channelId?"channelVideos":relatedId?"related":feed==="shorts"?"search":query||category!=="All"?"search":"home";
+  const term=videoId||channelId||relatedId||(feed==="shorts"?"#shorts":query)||(category==="All"?"":category);
+  let found=await remote(mode,term,cursor);
+  let normalized=found?normalizeResults(found.data):{videos:[],channels:[],nextCursor:undefined as string|undefined};
+  // Home and the distinct trending feed are two legitimate discovery sources.
+  // If home returns an unusually sparse initial batch, use trending as a fallback.
+  // Never substitute a different source for a continuation page.
+  if(mode==="home"&&!cursor&&normalized.videos.length<4){
+    const trending=await remote("trending");
+    if(trending){const more=normalizeResults(trending.data);
+      if(more.videos.length>normalized.videos.length){found=trending;normalized=more;}
+    }
+  }
+  if(found&&(normalized.videos.length||normalized.channels.length)){
+    const onlyShorts=feed==="shorts";
+    const videos=onlyShorts?normalized.videos.filter(v=>v.isShort):normalized.videos;
+    return {...normalized,videos,channels:onlyShorts?[]:normalized.channels,source:"marketplace",provider:found.provider};
+  }
+  if(videoId||query||channelId||relatedId||feed==="shorts"||cursor)return {videos:[],channels:[],source:"demo",message:feed==="shorts"?
+    "No Shorts positively identified by the provider. Ordinary videos are never shown in Shorts.":
+    "No live results returned. Check /api/health for provider configuration and upstream status."};
+  return {videos:filterDemo("",category),channels:[],source:"demo",message:"Live feed unavailable. Check /api/health and Vercel environment settings. Showing a clearly labeled demo catalog."};
 }
 export async function lookupChannel(id:string):Promise<Channel|null>{
   const found=await remote("channel",id);if(!found)return null;

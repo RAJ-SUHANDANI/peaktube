@@ -35,7 +35,8 @@ function time(x:unknown):string{
 export function normalizeVideo(input:unknown):Video|null{
   const outer=obj(input),v=obj(outer.video||outer.videoDetails||input),sn=obj(v.snippet);
   const author=obj(v.author||v.channel),stats=obj(v.stats||v.statistics),status=obj(v.status);
-  const id=text(pick(v,"videoId","id","video_id")||pick(obj(v.id),"videoId"));
+  const rawId=pick(v,"videoId","video_id","contentId")||(typeof v.id==="string"?v.id:pick(v.id,"videoId"));
+  const id=text(rawId);
   if(!validVideo.test(id))return null;
   const title=text(pick(v,"title","name")||sn.title)||"Untitled video";
   const name=text(pick(author,"title","name","channelName")||pick(v,"channelTitle","channelName","creator","author")||sn.channelTitle)||"YouTube creator";
@@ -61,7 +62,7 @@ export function normalizeVideo(input:unknown):Video|null{
 }
 export function normalizeChannel(input:unknown):Channel|null{
   const w=obj(input),v=obj(w.channel||input),stats=obj(v.stats||v.statistics);
-  const id=text(pick(v,"channelId","id"));
+  const id=text(pick(v,"channelId")||(typeof v.id==="string"?v.id:pick(v.id,"channelId")));
   if(!validChannel.test(id)&&!id.startsWith("@"))return null;
   return {id,title:text(pick(v,"title","name","channelName"))||"YouTube channel",
     avatar:image(pick(v,"avatar","avatars","thumbnail","thumbnails","picture","image")),
@@ -73,17 +74,17 @@ export function normalizeResults(payload:unknown):{videos:Video[];channels:Chann
   const videos:Video[]=[],channels:Channel[]=[],seenV=new Set<string>(),seenC=new Set<string>();
   const queue:Array<[unknown,number]>=[[payload,0]];
   let visits=0;
-  while(queue.length&&visits++<3000){
+  while(queue.length&&visits++<5000){
     const [item,depth]=queue.shift()!;
-    if(depth>15||item==null)continue;
+    if(depth>18||item==null)continue;
     if(Array.isArray(item)){for(const x of item.slice(0,150))queue.push([x,depth+1]);continue;}
     const o=obj(item);if(!Object.keys(o).length)continue;
     const kind=text(o.type).toLowerCase();
     if(kind==="channel"||o.channel&&!o.video&&kind!=="video"||depth===0){
       const ch=normalizeChannel(o);if(ch&&!seenC.has(ch.id)){seenC.add(ch.id);channels.push(ch);}
     }
-    if(kind==="video"||kind==="short"||o.videoId||obj(o.id).videoId||o.videoDetails||depth===0){
-      const v=normalizeVideo(o);if(v&&!seenV.has(v.id)&&v.embeddable!==false){if(kind==="short")v.isShort=true;seenV.add(v.id);videos.push(v);}
+    if(kind==="video"||kind==="short"||kind==="shorts"||o.videoId||obj(o.id).videoId||o.videoDetails||o.contentId||o.video||depth===0){
+      const v=normalizeVideo(o);if(v&&!seenV.has(v.id)&&v.embeddable!==false){if(kind==="short"||kind==="shorts")v.isShort=true;seenV.add(v.id);videos.push(v);}
     }
     // Traverse wrapper object variants from upstream including nested renderer/shelf structures.
     for(const [name,value] of Object.entries(o)){
@@ -92,7 +93,7 @@ export function normalizeResults(payload:unknown):{videos:Video[];channels:Chann
     }
   }
   const root=obj(payload),d=obj(root.data);
-  const direct=text(pick(root,"cursorNext","nextCursor","nextPageToken","continuationToken")||pick(d,"cursorNext","nextCursor","nextPageToken","continuationToken"));
+  const direct=text(pick(root,"cursorNext","nextCursor","nextPageToken","continuationToken","nextToken")||pick(d,"cursorNext","nextCursor","nextPageToken","continuationToken","nextToken"));
   let nextCursor=direct;
   if(!nextCursor){
     const todo:Array<[unknown,number]>=[[payload,0]];
@@ -102,9 +103,10 @@ export function normalizeResults(payload:unknown):{videos:Video[];channels:Chann
       if(depth>8||candidate==null)continue;
       if(Array.isArray(candidate)){for(const x of candidate.slice(0,35))todo.push([x,depth+1]);continue;}
       const x=obj(candidate);
-      nextCursor=text(pick(x,"cursorNext","nextCursor","nextPageToken","continuationToken","continuation"));
+      const continuation=pick(x,"cursorNext","nextCursor","nextPageToken","continuationToken","nextToken","continuation");
+      nextCursor=text(continuation)||text(pick(continuation,"token","continuation","nextCursor"));
       if(nextCursor)break;
-      for(const key of ["continuations","continuation","next","pagination","data","response","contents","items"]){
+      for(const key of ["continuations","nextContinuationData","continuation","next","pagination","data","response","contents","items"]){
         if(x[key]!=null&&typeof x[key]==="object")todo.push([x[key],depth+1]);
       }
     }
@@ -173,31 +175,50 @@ export async function remote(mode:Mode,arg="",cursor=""):Promise<{data:unknown;p
   }
   return null;
 }
+export type FeedDiagnostics={
+  mode:string; upstreamReceived:boolean; topLevelFields:string[]; parsedVideos:number;
+  parsedChannels:number; hasNextPage:boolean; stages:{mode:string;items:number;fields:string[]}[];
+};
+function safeKeys(payload:unknown):string[]{return Object.keys(obj(payload)).slice(0,20).filter(k=>/^[A-Za-z0-9_]{1,50}$/.test(k));}
 export async function lookupVideos({query="",category="All",videoId="",channelId="",relatedId="",cursor="",feed=""}:{
   query?:string;category?:string;videoId?:string;channelId?:string;relatedId?:string;cursor?:string;feed?:string
 }):Promise<VideoResponse>{
   const mode:Mode=videoId?"video":channelId?"channelVideos":relatedId?"related":feed==="shorts"?"search":query||category!=="All"?"search":"home";
   const term=videoId||channelId||relatedId||(feed==="shorts"?"#shorts":query)||(category==="All"?"":category);
-  let found=await remote(mode,term,cursor);
-  let normalized=found?normalizeResults(found.data):{videos:[],channels:[],nextCursor:undefined as string|undefined};
-  // Home and the distinct trending feed are two legitimate discovery sources.
-  // If home returns an unusually sparse initial batch, use trending as a fallback.
-  // Never substitute a different source for a continuation page.
-  if(mode==="home"&&!cursor&&normalized.videos.length<4){
+  const found=await remote(mode,term,cursor);
+  const normalized=found?normalizeResults(found.data):{videos:[] as Video[],channels:[] as Channel[],nextCursor:undefined as string|undefined};
+  const stages:FeedDiagnostics["stages"]=[{mode,items:normalized.videos.length,fields:found?safeKeys(found.data):[]}];
+  const diagnostics:FeedDiagnostics={
+    mode,upstreamReceived:Boolean(found),topLevelFields:found?safeKeys(found.data):[],
+    parsedVideos:normalized.videos.length,parsedChannels:normalized.channels.length,
+    hasNextPage:Boolean(normalized.nextCursor),stages
+  };
+  // An HTTP 200 is not proof of usable data. A sparse home response can be
+  // complemented by trending; preserve the home continuation token.
+  if(mode==="home"&&!cursor&&normalized.videos.length<8){
     const trending=await remote("trending");
-    if(trending){const more=normalizeResults(trending.data);
-      if(more.videos.length>normalized.videos.length){found=trending;normalized=more;}
+    if(trending){
+      const more=normalizeResults(trending.data);
+      stages.push({mode:"trending",items:more.videos.length,fields:safeKeys(trending.data)});
+      const ids=new Set(normalized.videos.map(v=>v.id));
+      for(const v of more.videos)if(!ids.has(v.id)){normalized.videos.push(v);ids.add(v.id);}
+      const channels=new Set(normalized.channels.map(c=>c.id));
+      for(const ch of more.channels)if(!channels.has(ch.id)){normalized.channels.push(ch);channels.add(ch.id);}
     }
   }
-  if(found&&(normalized.videos.length||normalized.channels.length)){
-    const onlyShorts=feed==="shorts";
-    const videos=onlyShorts?normalized.videos.filter(v=>v.isShort):normalized.videos;
-    return {...normalized,videos,channels:onlyShorts?[]:normalized.channels,source:"marketplace",provider:found.provider};
+  diagnostics.parsedVideos=normalized.videos.length;
+  diagnostics.parsedChannels=normalized.channels.length;
+  const videos=feed==="shorts"?normalized.videos.filter(v=>v.isShort):normalized.videos;
+  const channels=feed==="shorts"?[]:normalized.channels;
+  if(videos.length||channels.length){
+    return {...normalized,videos,channels,source:"marketplace",provider:found?.provider||"primary",diagnostics};
   }
-  if(videoId||query||channelId||relatedId||feed==="shorts"||cursor)return {videos:[],channels:[],source:"demo",message:feed==="shorts"?
-    "No Shorts positively identified by the provider. Ordinary videos are never shown in Shorts.":
-    "No live results returned. Check /api/health for provider configuration and upstream status."};
-  return {videos:filterDemo("",category),channels:[],source:"demo",message:"Live feed unavailable. Check /api/health and Vercel environment settings. Showing a clearly labeled demo catalog."};
+  if(videoId||query||channelId||relatedId||feed==="shorts"||cursor)
+    return {videos:[],channels:[],source:"demo",diagnostics,message:feed==="shorts"?
+      "Only provider-identified Shorts can appear here. YouTube138 returned no confirmed Shorts.":
+      "The provider returned no usable video results. Check response diagnostics: an HTTP 200 can still have zero parsed videos."};
+  return {videos:filterDemo("",category),channels:[],source:"demo",diagnostics,
+    message:"Live video data is currently unavailable or has an unrecognized format. Showing labeled sample content."};
 }
 export async function lookupChannel(id:string):Promise<Channel|null>{
   const found=await remote("channel",id);if(!found)return null;
